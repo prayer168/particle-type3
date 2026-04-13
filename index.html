@@ -91,8 +91,8 @@ window.addEventListener('resize', () => {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const COUNT    = 15000;
-const SPRING   = 0.003;
-const FRICTION = 0.965;
+const SPRING   = 0.012;    // moderate pull — converges in ~1s
+const FRICTION = 0.88;     // good damping — no overshooting
 const WANDER_F = 0.986;
 const MOUSE_R  = 130;
 const MOUSE_F  = 0.55;
@@ -102,40 +102,38 @@ let mouseX = -9999, mouseY = -9999;
 canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
 canvas.addEventListener('mouseleave', () => { mouseX = -9999; mouseY = -9999; });
 
-// ── Particles ─────────────────────────────────────────────────────────────────
-// Flat arrays for performance (15K particles)
-const px = new Float32Array(COUNT);   // position x
-const py = new Float32Array(COUNT);   // position y
-const vx = new Float32Array(COUNT);   // velocity x
-const vy = new Float32Array(COUNT);   // velocity y
-const tx = new Float32Array(COUNT);   // target x  (-1 = no target)
-const ty = new Float32Array(COUNT);   // target y
-const angle = new Float32Array(COUNT);
+// ── Particles (flat typed arrays) ─────────────────────────────────────────────
+const px = new Float32Array(COUNT);
+const py = new Float32Array(COUNT);
+const vx = new Float32Array(COUNT);
+const vy = new Float32Array(COUNT);
+const tx = new Float32Array(COUNT);   // -1 = no target
+const ty = new Float32Array(COUNT);
+const angle   = new Float32Array(COUNT);
 const turnSpd = new Float32Array(COUNT);
 const wandAcc = new Float32Array(COUNT);
-const psize = new Float32Array(COUNT);
-const layer = new Uint8Array(COUNT);  // 0,1,2 → alpha group
+const psize   = new Float32Array(COUNT);
+const layer   = new Uint8Array(COUNT);
 
 for (let i = 0; i < COUNT; i++) {
   px[i] = Math.random() * (W || 1280);
   py[i] = Math.random() * (H || 720);
-  vx[i] = 0;
-  vy[i] = 0;
-  tx[i] = -1;
-  ty[i] = -1;
+  vx[i] = 0;  vy[i] = 0;
+  tx[i] = -1; ty[i] = -1;
   angle[i]   = Math.random() * Math.PI * 2;
   turnSpd[i] = 0.004 + Math.random() * 0.006;
   wandAcc[i] = 0.003 + Math.random() * 0.004;
-  psize[i]   = 0.6 + Math.random() * 1.0;
+  psize[i]   = 0.7 + Math.random() * 1.0;
   layer[i]   = (Math.random() * 3) | 0;
 }
 
 // ── Text → pixel positions (multi-line) ───────────────────────────────────────
+const FONT_FAM = '"Microsoft YaHei","PingFang SC","Hiragino Sans GB",Arial,sans-serif';
+
 function samplePixels(text) {
   if (!text.trim()) return [];
 
   const lines = text.split('\n');
-  // Remove trailing empty line from final newline but keep intentional blank lines
   while (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
   if (lines.every(l => l.trim() === '')) return [];
 
@@ -144,26 +142,26 @@ function samplePixels(text) {
   oc.height  = H;
   const octx = oc.getContext('2d');
 
-  // Dynamic font size — use measureText() for accurate Chinese width
   const lineCount = lines.length;
-  const fontFam   = '"Microsoft YaHei","PingFang SC","Hiragino Sans GB",Arial,sans-serif';
 
-  // Start with vertical constraint
-  let fontSize = Math.min((H * 0.65) / (lineCount * 1.35), 200);
-  fontSize = Math.max(18, fontSize);
+  // ── Font sizing: start with vertical constraint, then shrink by measured width ──
+  let fontSize = Math.min((H * 0.60) / (lineCount * 1.35), 200);
 
-  // Measure actual text width and shrink if any line overflows
-  octx.font = `bold ${fontSize}px ${fontFam}`;
-  let maxMeasured = 0;
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    const mw = octx.measureText(line).width;
-    if (mw > maxMeasured) maxMeasured = mw;
+  // Binary search: find largest font where text fits within W * 0.85
+  let lo = 18, hi = fontSize;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) / 2;
+    octx.font = `bold ${mid}px ${FONT_FAM}`;
+    let fits = true;
+    for (const line of lines) {
+      if (line.trim() && octx.measureText(line).width > W * 0.85) {
+        fits = false; break;
+      }
+    }
+    if (fits) lo = mid; else hi = mid;
   }
-  if (maxMeasured > W * 0.88) {
-    fontSize = Math.max(18, fontSize * (W * 0.88) / maxMeasured);
-    octx.font = `bold ${fontSize}px ${fontFam}`;
-  }
+  fontSize = Math.max(18, lo);
+  octx.font = `bold ${fontSize}px ${FONT_FAM}`;
 
   const lineHeight = fontSize * 1.35;
   const totalH     = lineCount * lineHeight;
@@ -179,17 +177,30 @@ function samplePixels(text) {
     }
   }
 
+  // ── Scan pixels — low alpha threshold to capture anti-aliased strokes ──
   const { data } = octx.getImageData(0, 0, W, H);
   const pts = [];
 
-  // Sample every 2px
   for (let y = 0; y < H; y += 2) {
     for (let x = 0; x < W; x += 2) {
-      if (data[((y * W) + x) * 4 + 3] > 110) {
+      if (data[((y * W) + x) * 4 + 3] > 40) {
         pts.push(x, y);
       }
     }
   }
+
+  // If too few points (tiny text), resample at step=1
+  if ((pts.length >> 1) < COUNT * 0.3) {
+    pts.length = 0;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (data[((y * W) + x) * 4 + 3] > 40) {
+          pts.push(x, y);
+        }
+      }
+    }
+  }
+
   return pts;
 }
 
@@ -204,50 +215,16 @@ function shufflePairs(arr) {
   }
 }
 
-// ── Grid-accelerated nearest-neighbor assignment ──────────────────────────────
+// ── Assignment: grid-sort with fine cells ─────────────────────────────────────
 //
-//  Two-phase approach that keeps existing formations STABLE:
+//  Fine grid (20px cells) ensures particles ↔ targets in the same 20×20 area
+//  get matched together. Combined with SPRING=0.012, any small shift from
+//  centering adjustment settles in <0.5s.
 //
-//  Phase 1 — Targeted particles find their nearest NEW target via grid search.
-//            Particles already on "你" stay on "你"; only edge particles peel off.
-//  Phase 2 — Remaining targets assigned to wandering particles via grid-sort.
+//  This is simpler and more reliable than greedy nearest-neighbor, which
+//  caused some particles to get stuck on bad far-away assignments.
 //
-//  Grid search is O(n·k) where k = avg targets per 9 cells, fast for 15K.
-//
-const CELL = 50;
-
-function gridNearest(sx, sy, grid, cols, rows, pX, pY, taken) {
-  const cx = Math.min(cols - 1, Math.max(0, (sx / CELL) | 0));
-  const cy = Math.min(rows - 1, Math.max(0, (sy / CELL) | 0));
-  let bestI = -1, bestD = Infinity;
-  const maxR = Math.max(cols, rows);
-
-  for (let r = 0; r <= maxR; r++) {
-    // Early exit: closest possible point in ring r is (r-1)*CELL away
-    if (r >= 2 && bestD < ((r - 1) * CELL) * ((r - 1) * CELL)) break;
-
-    for (let dy = -r; dy <= r; dy++) {
-      for (let dx = -r; dx <= r; dx++) {
-        if (r > 0 && Math.abs(dx) < r && Math.abs(dy) < r) continue; // ring border only
-        const gx = cx + dx, gy = cy + dy;
-        if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) continue;
-        const cell = grid[gy * cols + gx];
-        for (let k = 0; k < cell.length; k++) {
-          const ti = cell[k];
-          if (taken[ti]) continue;
-          const ddx = pX[ti] - sx, ddy = pY[ti] - sy;
-          const d = ddx * ddx + ddy * ddy;
-          if (d < bestD) { bestD = d; bestI = ti; }
-        }
-      }
-    }
-    if (bestI >= 0 && r >= 1) {
-      // Found in this ring; check one more ring to be safe, then stop
-      if (bestD < (r * CELL) * (r * CELL)) break;
-    }
-  }
-  return bestI;
-}
+const CELL = 20;
 
 function assignTargets(text) {
   const pts       = samplePixels(text);
@@ -256,57 +233,38 @@ function assignTargets(text) {
 
   shufflePairs(pts);
 
-  // Build target pool — cycle with jitter if fewer pixels than particles
+  // Build target pool for ALL particles (cycle + jitter if needed)
   const poolX = new Float32Array(COUNT);
   const poolY = new Float32Array(COUNT);
-  const poolTaken = new Uint8Array(COUNT);
   for (let i = 0; i < COUNT; i++) {
     const src = (i % pairCount) * 2;
-    poolX[i] = pts[src]     + (i < pairCount ? 0 : (Math.random() - 0.5) * 3);
-    poolY[i] = pts[src + 1] + (i < pairCount ? 0 : (Math.random() - 0.5) * 3);
+    const jit = i >= pairCount;
+    poolX[i] = pts[src]     + (jit ? (Math.random() - 0.5) * 2.5 : 0);
+    poolY[i] = pts[src + 1] + (jit ? (Math.random() - 0.5) * 2.5 : 0);
   }
 
-  // Build spatial grid of targets
+  // Sort targets and particles by fine grid cell
   const cols = Math.ceil(W / CELL) || 1;
-  const rows = Math.ceil(H / CELL) || 1;
-  const grid = new Array(cols * rows);
-  for (let i = 0; i < grid.length; i++) grid[i] = [];
+  const ck = (x, y) => (((y / CELL) | 0) * cols + ((x / CELL) | 0));
+
+  const tIdx = new Array(COUNT);
+  const pIdx = new Array(COUNT);
+  for (let i = 0; i < COUNT; i++) { tIdx[i] = i; pIdx[i] = i; }
+
+  tIdx.sort((a, b) => ck(poolX[a], poolY[a]) - ck(poolX[b], poolY[b]));
+  pIdx.sort((a, b) => {
+    // Use old target position if available, else current position
+    const ax = tx[a] >= 0 ? tx[a] : px[a];
+    const ay = tx[a] >= 0 ? ty[a] : py[a];
+    const bx = tx[b] >= 0 ? tx[b] : px[b];
+    const by = tx[b] >= 0 ? ty[b] : py[b];
+    return ck(ax, ay) - ck(bx, by);
+  });
+
+  // Match 1:1 in sorted order
   for (let i = 0; i < COUNT; i++) {
-    const c = Math.min(cols - 1, Math.max(0, (poolX[i] / CELL) | 0));
-    const r = Math.min(rows - 1, Math.max(0, (poolY[i] / CELL) | 0));
-    grid[r * cols + c].push(i);
-  }
-
-  // ── Phase 1: targeted particles → nearest available target ──
-  //    Uses OLD TARGET position (not current position) so in-flight particles
-  //    don't get randomly reassigned to distant targets on each keystroke.
-  for (let i = 0; i < COUNT; i++) {
-    if (tx[i] < 0) continue;   // skip wanderers
-    const best = gridNearest(tx[i], ty[i], grid, cols, rows, poolX, poolY, poolTaken);
-    if (best >= 0) {
-      poolTaken[best] = 1;
-      tx[i] = poolX[best];
-      ty[i] = poolY[best];
-    } else {
-      tx[i] = -1;
-      ty[i] = -1;
-    }
-  }
-
-  // ── Phase 2: remaining targets → wandering particles (grid-sort) ──
-  const remT = [];
-  for (let i = 0; i < COUNT; i++) { if (!poolTaken[i]) remT.push(i); }
-  const wand = [];
-  for (let i = 0; i < COUNT; i++) { if (tx[i] < 0) wand.push(i); }
-
-  const ck = (x, y) => ((y / CELL) | 0) * cols + ((x / CELL) | 0);
-  remT.sort((a, b) => ck(poolX[a], poolY[a]) - ck(poolX[b], poolY[b]));
-  wand.sort((a, b) => ck(px[a], py[a]) - ck(px[b], py[b]));
-
-  const n = Math.min(remT.length, wand.length);
-  for (let i = 0; i < n; i++) {
-    tx[wand[i]] = poolX[remT[i]];
-    ty[wand[i]] = poolY[remT[i]];
+    tx[pIdx[i]] = poolX[tIdx[i]];
+    ty[pIdx[i]] = poolY[tIdx[i]];
   }
 }
 
@@ -356,7 +314,6 @@ function update() {
     px[i] += vx[i];
     py[i] += vy[i];
 
-    // Wrap edges
     if      (px[i] < -6)     px[i] = W + 6;
     else if (px[i] > W + 6)  px[i] = -6;
     if      (py[i] < -6)     py[i] = H + 6;
@@ -364,11 +321,11 @@ function update() {
   }
 }
 
-// ── Render (batched by alpha layer — 3 draw calls total) ──────────────────────
-const LAYER_ALPHA = [0.25, 0.48, 0.72];
+// ── Render (3 alpha layers, batched) ──────────────────────────────────────────
+const LAYER_ALPHA = [0.28, 0.52, 0.78];
 
 function draw() {
-  ctx.fillStyle = 'rgba(8, 8, 16, 0.20)';
+  ctx.fillStyle = 'rgba(8, 8, 16, 0.22)';
   ctx.fillRect(0, 0, W, H);
 
   for (let l = 0; l < 3; l++) {
@@ -395,10 +352,8 @@ function loop() {
         py[i] = Math.random() * H;
       }
     }
-    lastW = W;
-    lastH = H;
+    lastW = W; lastH = H;
   }
-
   update();
   draw();
   requestAnimationFrame(loop);
@@ -413,11 +368,10 @@ function scheduleAssign(text) {
   debounceTimer = setTimeout(() => {
     if (text.trim()) assignTargets(text);
     else             clearTargets();
-  }, 80);
+  }, 100);
 }
 
 input.addEventListener('input', () => {
-  // Auto-resize textarea height
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 120) + 'px';
   scheduleAssign(input.value);
