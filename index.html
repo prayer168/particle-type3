@@ -144,21 +144,31 @@ function samplePixels(text) {
   oc.height  = H;
   const octx = oc.getContext('2d');
 
-  // Dynamic font size — fit widest line and all lines vertically
-  const maxLineChars = Math.max(...lines.map(l => [...l].length), 1);
-  const lineCount    = lines.length;
+  // Dynamic font size — use measureText() for accurate Chinese width
+  const lineCount = lines.length;
+  const fontFam   = '"Microsoft YaHei","PingFang SC","Hiragino Sans GB",Arial,sans-serif';
 
-  let fontSize = Math.min(
-    (H * 0.65) / (lineCount * 1.35),
-    (W * 0.85) / maxLineChars * 1.05
-  );
-  fontSize = Math.max(18, Math.min(fontSize, 200));
+  // Start with vertical constraint
+  let fontSize = Math.min((H * 0.65) / (lineCount * 1.35), 200);
+  fontSize = Math.max(18, fontSize);
+
+  // Measure actual text width and shrink if any line overflows
+  octx.font = `bold ${fontSize}px ${fontFam}`;
+  let maxMeasured = 0;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const mw = octx.measureText(line).width;
+    if (mw > maxMeasured) maxMeasured = mw;
+  }
+  if (maxMeasured > W * 0.88) {
+    fontSize = Math.max(18, fontSize * (W * 0.88) / maxMeasured);
+    octx.font = `bold ${fontSize}px ${fontFam}`;
+  }
 
   const lineHeight = fontSize * 1.35;
   const totalH     = lineCount * lineHeight;
   const startY     = (H - totalH) / 2 + lineHeight * 0.5;
 
-  octx.font         = `bold ${fontSize}px "Microsoft YaHei","PingFang SC","Hiragino Sans GB",Arial,sans-serif`;
   octx.textAlign    = 'center';
   octx.textBaseline = 'middle';
   octx.fillStyle    = '#fff';
@@ -268,10 +278,11 @@ function assignTargets(text) {
   }
 
   // ── Phase 1: targeted particles → nearest available target ──
-  //    Uses current position so particles stay near their character.
+  //    Uses OLD TARGET position (not current position) so in-flight particles
+  //    don't get randomly reassigned to distant targets on each keystroke.
   for (let i = 0; i < COUNT; i++) {
     if (tx[i] < 0) continue;   // skip wanderers
-    const best = gridNearest(px[i], py[i], grid, cols, rows, poolX, poolY, poolTaken);
+    const best = gridNearest(tx[i], ty[i], grid, cols, rows, poolX, poolY, poolTaken);
     if (best >= 0) {
       poolTaken[best] = 1;
       tx[i] = poolX[best];
