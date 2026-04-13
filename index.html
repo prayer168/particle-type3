@@ -91,8 +91,12 @@ window.addEventListener('resize', () => {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const COUNT    = 15000;
-const SPRING   = 0.012;    // moderate pull — converges in ~1s
-const FRICTION = 0.88;     // good damping — no overshooting
+// Two-speed spring: fast approach from far, slow/dreamy when close
+const SPRING_FAR  = 0.028;   // strong pull when > 80px away
+const FRIC_FAR    = 0.80;
+const SPRING_NEAR = 0.006;   // gentle drift when < 80px
+const FRIC_NEAR   = 0.93;
+const NEAR_DIST2  = 6400;    // 80px² threshold
 const WANDER_F = 0.986;
 const MOUSE_R  = 130;
 const MOUSE_F  = 0.55;
@@ -215,16 +219,15 @@ function shufflePairs(arr) {
   }
 }
 
-// ── Assignment: grid-sort with fine cells ─────────────────────────────────────
+// ── Assignment: priority nearest-neighbor + grid-sort fallback ────────────────
 //
-//  Fine grid (20px cells) ensures particles ↔ targets in the same 20×20 area
-//  get matched together. Combined with SPRING=0.012, any small shift from
-//  centering adjustment settles in <0.5s.
+//  Phase 1 — Settled particles (close to old target) get FIRST pick of nearby
+//            new targets via local grid search (5×5 cells). This keeps formed
+//            characters stable — particles don't move unless they have to.
+//  Phase 2 — Remaining particles + targets matched via grid-sort fallback.
 //
-//  This is simpler and more reliable than greedy nearest-neighbor, which
-//  caused some particles to get stuck on bad far-away assignments.
-//
-const CELL = 20;
+const ACELL    = 30;     // grid cell size for spatial lookup
+const SEARCH_R = 2;      // search ±2 cells = 5×5 neighborhood = 150×150px
 
 function assignTargets(text) {
   const pts       = samplePixels(text);
@@ -233,9 +236,10 @@ function assignTargets(text) {
 
   shufflePairs(pts);
 
-  // Build target pool for ALL particles (cycle + jitter if needed)
-  const poolX = new Float32Array(COUNT);
-  const poolY = new Float32Array(COUNT);
+  // Build target pool for ALL particles
+  const poolX    = new Float32Array(COUNT);
+  const poolY    = new Float32Array(COUNT);
+  const poolUsed = new Uint8Array(COUNT);
   for (let i = 0; i < COUNT; i++) {
     const src = (i % pairCount) * 2;
     const jit = i >= pairCount;
@@ -243,28 +247,77 @@ function assignTargets(text) {
     poolY[i] = pts[src + 1] + (jit ? (Math.random() - 0.5) * 2.5 : 0);
   }
 
-  // Sort targets and particles by fine grid cell
-  const cols = Math.ceil(W / CELL) || 1;
-  const ck = (x, y) => (((y / CELL) | 0) * cols + ((x / CELL) | 0));
-
-  const tIdx = new Array(COUNT);
-  const pIdx = new Array(COUNT);
-  for (let i = 0; i < COUNT; i++) { tIdx[i] = i; pIdx[i] = i; }
-
-  tIdx.sort((a, b) => ck(poolX[a], poolY[a]) - ck(poolX[b], poolY[b]));
-  pIdx.sort((a, b) => {
-    // Use old target position if available, else current position
-    const ax = tx[a] >= 0 ? tx[a] : px[a];
-    const ay = tx[a] >= 0 ? ty[a] : py[a];
-    const bx = tx[b] >= 0 ? tx[b] : px[b];
-    const by = tx[b] >= 0 ? ty[b] : py[b];
-    return ck(ax, ay) - ck(bx, by);
-  });
-
-  // Match 1:1 in sorted order
+  // Build spatial grid of targets
+  const cols = Math.ceil(W / ACELL) || 1;
+  const rows = Math.ceil(H / ACELL) || 1;
+  const grid = new Array(cols * rows);
+  for (let i = 0; i < grid.length; i++) grid[i] = [];
   for (let i = 0; i < COUNT; i++) {
-    tx[pIdx[i]] = poolX[tIdx[i]];
-    ty[pIdx[i]] = poolY[tIdx[i]];
+    const c = Math.min(cols - 1, Math.max(0, (poolX[i] / ACELL) | 0));
+    const r = Math.min(rows - 1, Math.max(0, (poolY[i] / ACELL) | 0));
+    grid[r * cols + c].push(i);
+  }
+
+  // ── Phase 1: settled particles first, then in-flight ones ──
+  //    Sort targeted particles by distance-to-target (closest = most settled = first pick)
+  const targeted = [];
+  for (let i = 0; i < COUNT; i++) {
+    if (tx[i] < 0) continue;
+    const dx = px[i] - tx[i], dy = py[i] - ty[i];
+    targeted.push(i, dx * dx + dy * dy);  // [index, dist², index, dist², ...]
+  }
+  // Sort by dist² (ascending) — settled particles process first
+  const order = [];
+  for (let i = 0; i < targeted.length; i += 2) order.push(i >> 1);
+  order.sort((a, b) => targeted[a * 2 + 1] - targeted[b * 2 + 1]);
+
+  for (let o = 0; o < order.length; o++) {
+    const pi = targeted[order[o] * 2];  // particle index
+
+    // Search 5×5 cell neighborhood around OLD target
+    const cx = Math.min(cols - 1, Math.max(0, (tx[pi] / ACELL) | 0));
+    const cy = Math.min(rows - 1, Math.max(0, (ty[pi] / ACELL) | 0));
+    let bestI = -1, bestD = Infinity;
+
+    for (let dy = -SEARCH_R; dy <= SEARCH_R; dy++) {
+      for (let dx = -SEARCH_R; dx <= SEARCH_R; dx++) {
+        const gx = cx + dx, gy = cy + dy;
+        if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) continue;
+        const cell = grid[gy * cols + gx];
+        for (let k = 0; k < cell.length; k++) {
+          const ti = cell[k];
+          if (poolUsed[ti]) continue;
+          const ddx = poolX[ti] - tx[pi], ddy = poolY[ti] - ty[pi];
+          const d = ddx * ddx + ddy * ddy;
+          if (d < bestD) { bestD = d; bestI = ti; }
+        }
+      }
+    }
+
+    if (bestI >= 0) {
+      poolUsed[bestI] = 1;
+      tx[pi] = poolX[bestI];
+      ty[pi] = poolY[bestI];
+    } else {
+      tx[pi] = -1;   // no nearby target → goes to Phase 2
+      ty[pi] = -1;
+    }
+  }
+
+  // ── Phase 2: remaining targets ↔ remaining particles via grid-sort ──
+  const remT = [];
+  for (let i = 0; i < COUNT; i++) { if (!poolUsed[i]) remT.push(i); }
+  const wand = [];
+  for (let i = 0; i < COUNT; i++) { if (tx[i] < 0) wand.push(i); }
+
+  const ck = (x, y) => (((y / ACELL) | 0) * cols + ((x / ACELL) | 0));
+  remT.sort((a, b) => ck(poolX[a], poolY[a]) - ck(poolX[b], poolY[b]));
+  wand.sort((a, b) => ck(px[a], py[a]) - ck(px[b], py[b]));
+
+  const n = Math.min(remT.length, wand.length);
+  for (let i = 0; i < n; i++) {
+    tx[wand[i]] = poolX[remT[i]];
+    ty[wand[i]] = poolY[remT[i]];
   }
 }
 
@@ -292,8 +345,11 @@ function update() {
     if (tx[i] >= 0) {
       const dx = tx[i] - px[i];
       const dy = ty[i] - py[i];
-      vx[i] = (vx[i] + dx * SPRING) * FRICTION;
-      vy[i] = (vy[i] + dy * SPRING) * FRICTION;
+      const d2 = dx * dx + dy * dy;
+      const sp = d2 > NEAR_DIST2 ? SPRING_FAR : SPRING_NEAR;
+      const fr = d2 > NEAR_DIST2 ? FRIC_FAR   : FRIC_NEAR;
+      vx[i] = (vx[i] + dx * sp) * fr;
+      vy[i] = (vy[i] + dy * sp) * fr;
     } else {
       angle[i] += (Math.random() - 0.5) * turnSpd[i];
       vx[i] = (vx[i] + Math.cos(angle[i]) * wandAcc[i]) * WANDER_F;
