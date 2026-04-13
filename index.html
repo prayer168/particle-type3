@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>粒子文字 v3</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #080810; overflow: hidden; }
+    canvas { display: block; }
+
+    #ui {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #text-input {
+      width: 600px;
+      max-width: 92vw;
+      min-height: 48px;
+      max-height: 120px;
+      padding: 12px 28px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 20px;
+      color: #fff;
+      font-size: 18px;
+      font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", Arial, sans-serif;
+      text-align: center;
+      outline: none;
+      resize: none;
+      overflow-y: auto;
+      backdrop-filter: blur(12px);
+      transition: border-color 0.4s, box-shadow 0.4s;
+      letter-spacing: 1px;
+      line-height: 1.5;
+    }
+    #text-input:focus {
+      border-color: rgba(255, 255, 255, 0.3);
+      box-shadow: 0 0 24px rgba(255, 255, 255, 0.06);
+    }
+    #text-input::placeholder { color: rgba(255, 255, 255, 0.16); }
+
+    #hint {
+      color: rgba(255, 255, 255, 0.12);
+      font-size: 12px;
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="ui">
+    <textarea id="text-input" placeholder="输入文字，按 Enter 换行…" maxlength="60" rows="1" spellcheck="false"></textarea>
+    <span id="hint">支持中文与英文 · 可换行 · 15000 粒子</span>
+  </div>
+
+<script>
+'use strict';
+
+// ── Canvas ────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+const input  = document.getElementById('text-input');
+
+let W = 0, H = 0;
+
+function resize() {
+  const w = window.innerWidth  || document.documentElement.clientWidth  || 1280;
+  const h = window.innerHeight || document.documentElement.clientHeight || 720;
+  if (w === W && h === H) return;
+  W = canvas.width  = w;
+  H = canvas.height = h;
+}
+resize();
+(function ensureSize() {
+  if (W === 0 || H === 0) { resize(); requestAnimationFrame(ensureSize); }
+})();
+window.addEventListener('resize', () => {
+  resize();
+  if (input.value.trim()) scheduleAssign(input.value);
+});
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const COUNT    = 15000;
+const SPRING   = 0.003;
+const FRICTION = 0.965;
+const WANDER_F = 0.986;
+const MOUSE_R  = 130;
+const MOUSE_F  = 0.55;
+
+// ── Mouse ─────────────────────────────────────────────────────────────────────
+let mouseX = -9999, mouseY = -9999;
+canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+canvas.addEventListener('mouseleave', () => { mouseX = -9999; mouseY = -9999; });
+
+// ── Particles ─────────────────────────────────────────────────────────────────
+// Flat arrays for performance (15K particles)
+const px = new Float32Array(COUNT);   // position x
+const py = new Float32Array(COUNT);   // position y
+const vx = new Float32Array(COUNT);   // velocity x
+const vy = new Float32Array(COUNT);   // velocity y
+const tx = new Float32Array(COUNT);   // target x  (-1 = no target)
+const ty = new Float32Array(COUNT);   // target y
+const angle = new Float32Array(COUNT);
+const turnSpd = new Float32Array(COUNT);
+const wandAcc = new Float32Array(COUNT);
+const psize = new Float32Array(COUNT);
+const layer = new Uint8Array(COUNT);  // 0,1,2 → alpha group
+
+for (let i = 0; i < COUNT; i++) {
+  px[i] = Math.random() * (W || 1280);
+  py[i] = Math.random() * (H || 720);
+  vx[i] = 0;
+  vy[i] = 0;
+  tx[i] = -1;
+  ty[i] = -1;
+  angle[i]   = Math.random() * Math.PI * 2;
+  turnSpd[i] = 0.004 + Math.random() * 0.006;
+  wandAcc[i] = 0.003 + Math.random() * 0.004;
+  psize[i]   = 0.6 + Math.random() * 1.0;
+  layer[i]   = (Math.random() * 3) | 0;
+}
+
+// ── Text → pixel positions (multi-line) ───────────────────────────────────────
+function samplePixels(text) {
+  if (!text.trim()) return [];
+
+  const lines = text.split('\n');
+  // Remove trailing empty line from final newline but keep intentional blank lines
+  while (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  if (lines.every(l => l.trim() === '')) return [];
+
+  const oc   = document.createElement('canvas');
+  oc.width   = W;
+  oc.height  = H;
+  const octx = oc.getContext('2d');
+
+  // Dynamic font size — fit widest line and all lines vertically
+  const maxLineChars = Math.max(...lines.map(l => [...l].length), 1);
+  const lineCount    = lines.length;
+
+  let fontSize = Math.min(
+    (H * 0.65) / (lineCount * 1.35),
+    (W * 0.85) / maxLineChars * 1.05
+  );
+  fontSize = Math.max(18, Math.min(fontSize, 200));
+
+  const lineHeight = fontSize * 1.35;
+  const totalH     = lineCount * lineHeight;
+  const startY     = (H - totalH) / 2 + lineHeight * 0.5;
+
+  octx.font         = `bold ${fontSize}px "Microsoft YaHei","PingFang SC","Hiragino Sans GB",Arial,sans-serif`;
+  octx.textAlign    = 'center';
+  octx.textBaseline = 'middle';
+  octx.fillStyle    = '#fff';
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim()) {
+      octx.fillText(lines[i], W / 2, startY + i * lineHeight);
+    }
+  }
+
+  const { data } = octx.getImageData(0, 0, W, H);
+  const pts = [];
+
+  // Sample every 2px
+  for (let y = 0; y < H; y += 2) {
+    for (let x = 0; x < W; x += 2) {
+      if (data[((y * W) + x) * 4 + 3] > 110) {
+        pts.push(x, y);
+      }
+    }
+  }
+  return pts;
+}
+
+// ── Shuffle flat paired array ─────────────────────────────────────────────────
+function shufflePairs(arr) {
+  const n = arr.length >> 1;
+  for (let i = n - 1; i > 0; i--) {
+    const j  = (Math.random() * (i + 1)) | 0;
+    const ai = i * 2, aj = j * 2;
+    let t = arr[ai];   arr[ai]   = arr[aj];   arr[aj]   = t;
+        t = arr[ai+1]; arr[ai+1] = arr[aj+1]; arr[aj+1] = t;
+  }
+}
+
+// ── Grid-sorted assignment (O(n log n) instead of O(n²)) ─────────────────────
+//
+//  With 15K particles, brute-force nearest-neighbor is too slow.
+//  Instead: sort both particles and targets by spatial grid cell,
+//  then match in order. Particles in the same screen region get
+//  matched to nearby targets → smooth transitions preserved.
+//
+const CELL = 48;
+
+function cellKey(x, y) {
+  const cols = Math.ceil(W / CELL) || 1;
+  return ((y / CELL) | 0) * cols + ((x / CELL) | 0);
+}
+
+function assignTargets(text) {
+  const pts       = samplePixels(text);
+  const pairCount = pts.length >> 1;
+  if (pairCount === 0) { clearTargets(); return; }
+
+  shufflePairs(pts);
+
+  // Build target pool — cycle with jitter if fewer pixels than particles
+  const poolX = new Float32Array(COUNT);
+  const poolY = new Float32Array(COUNT);
+  for (let i = 0; i < COUNT; i++) {
+    const src = (i % pairCount) * 2;
+    poolX[i] = pts[src]     + (i < pairCount ? 0 : (Math.random() - 0.5) * 3);
+    poolY[i] = pts[src + 1] + (i < pairCount ? 0 : (Math.random() - 0.5) * 3);
+  }
+
+  // Sort indices by grid cell for spatial coherence
+  const tOrder = new Uint16Array(COUNT);
+  const pOrder = new Uint16Array(COUNT);
+  for (let i = 0; i < COUNT; i++) { tOrder[i] = i; pOrder[i] = i; }
+
+  tOrder.sort((a, b) => cellKey(poolX[a], poolY[a]) - cellKey(poolX[b], poolY[b]));
+  pOrder.sort((a, b) => cellKey(px[a], py[a]) - cellKey(px[b], py[b]));
+
+  // Match 1:1 in sorted order
+  for (let i = 0; i < COUNT; i++) {
+    const pi = pOrder[i];
+    const ti = tOrder[i];
+    tx[pi] = poolX[ti];
+    ty[pi] = poolY[ti];
+  }
+}
+
+function clearTargets() {
+  for (let i = 0; i < COUNT; i++) {
+    if (tx[i] >= 0) {
+      const a = Math.random() * Math.PI * 2;
+      const f = 0.3 + Math.random() * 0.5;
+      vx[i] += Math.cos(a) * f;
+      vy[i] += Math.sin(a) * f;
+    }
+    tx[i] = -1;
+    ty[i] = -1;
+  }
+}
+
+// ── Simulation ────────────────────────────────────────────────────────────────
+let tick = 0;
+
+function update() {
+  tick++;
+  const mr2 = MOUSE_R * MOUSE_R;
+
+  for (let i = 0; i < COUNT; i++) {
+    if (tx[i] >= 0) {
+      const dx = tx[i] - px[i];
+      const dy = ty[i] - py[i];
+      vx[i] = (vx[i] + dx * SPRING) * FRICTION;
+      vy[i] = (vy[i] + dy * SPRING) * FRICTION;
+    } else {
+      angle[i] += (Math.random() - 0.5) * turnSpd[i];
+      vx[i] = (vx[i] + Math.cos(angle[i]) * wandAcc[i]) * WANDER_F;
+      vy[i] = (vy[i] + Math.sin(angle[i]) * wandAcc[i]) * WANDER_F;
+    }
+
+    // Mouse repulsion
+    const mdx = px[i] - mouseX;
+    const mdy = py[i] - mouseY;
+    const md2 = mdx * mdx + mdy * mdy;
+    if (md2 < mr2 && md2 > 1) {
+      const dist  = Math.sqrt(md2);
+      const force = (1 - dist / MOUSE_R) * MOUSE_F;
+      vx[i] += (mdx / dist) * force;
+      vy[i] += (mdy / dist) * force;
+    }
+
+    px[i] += vx[i];
+    py[i] += vy[i];
+
+    // Wrap edges
+    if      (px[i] < -6)     px[i] = W + 6;
+    else if (px[i] > W + 6)  px[i] = -6;
+    if      (py[i] < -6)     py[i] = H + 6;
+    else if (py[i] > H + 6)  py[i] = -6;
+  }
+}
+
+// ── Render (batched by alpha layer — 3 draw calls total) ──────────────────────
+const LAYER_ALPHA = [0.25, 0.48, 0.72];
+
+function draw() {
+  ctx.fillStyle = 'rgba(8, 8, 16, 0.20)';
+  ctx.fillRect(0, 0, W, H);
+
+  for (let l = 0; l < 3; l++) {
+    ctx.fillStyle = `rgba(255,255,255,${LAYER_ALPHA[l]})`;
+    ctx.beginPath();
+    for (let i = 0; i < COUNT; i++) {
+      if (layer[i] !== l) continue;
+      const s = psize[i];
+      ctx.rect(px[i] - s * 0.5, py[i] - s * 0.5, s, s);
+    }
+    ctx.fill();
+  }
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+let lastW = W, lastH = H;
+
+function loop() {
+  resize();
+  if (W !== lastW || H !== lastH) {
+    if (lastW === 0 || lastH === 0) {
+      for (let i = 0; i < COUNT; i++) {
+        px[i] = Math.random() * W;
+        py[i] = Math.random() * H;
+      }
+    }
+    lastW = W;
+    lastH = H;
+  }
+
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+let debounceTimer = null;
+
+function scheduleAssign(text) {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    if (text.trim()) assignTargets(text);
+    else             clearTargets();
+  }, 80);
+}
+
+input.addEventListener('input', () => {
+  // Auto-resize textarea height
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+  scheduleAssign(input.value);
+});
+</script>
+</body>
+</html>
