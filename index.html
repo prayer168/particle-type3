@@ -194,18 +194,49 @@ function shufflePairs(arr) {
   }
 }
 
-// ── Grid-sorted assignment (O(n log n) instead of O(n²)) ─────────────────────
+// ── Grid-accelerated nearest-neighbor assignment ──────────────────────────────
 //
-//  With 15K particles, brute-force nearest-neighbor is too slow.
-//  Instead: sort both particles and targets by spatial grid cell,
-//  then match in order. Particles in the same screen region get
-//  matched to nearby targets → smooth transitions preserved.
+//  Two-phase approach that keeps existing formations STABLE:
 //
-const CELL = 48;
+//  Phase 1 — Targeted particles find their nearest NEW target via grid search.
+//            Particles already on "你" stay on "你"; only edge particles peel off.
+//  Phase 2 — Remaining targets assigned to wandering particles via grid-sort.
+//
+//  Grid search is O(n·k) where k = avg targets per 9 cells, fast for 15K.
+//
+const CELL = 50;
 
-function cellKey(x, y) {
-  const cols = Math.ceil(W / CELL) || 1;
-  return ((y / CELL) | 0) * cols + ((x / CELL) | 0);
+function gridNearest(sx, sy, grid, cols, rows, pX, pY, taken) {
+  const cx = Math.min(cols - 1, Math.max(0, (sx / CELL) | 0));
+  const cy = Math.min(rows - 1, Math.max(0, (sy / CELL) | 0));
+  let bestI = -1, bestD = Infinity;
+  const maxR = Math.max(cols, rows);
+
+  for (let r = 0; r <= maxR; r++) {
+    // Early exit: closest possible point in ring r is (r-1)*CELL away
+    if (r >= 2 && bestD < ((r - 1) * CELL) * ((r - 1) * CELL)) break;
+
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (r > 0 && Math.abs(dx) < r && Math.abs(dy) < r) continue; // ring border only
+        const gx = cx + dx, gy = cy + dy;
+        if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) continue;
+        const cell = grid[gy * cols + gx];
+        for (let k = 0; k < cell.length; k++) {
+          const ti = cell[k];
+          if (taken[ti]) continue;
+          const ddx = pX[ti] - sx, ddy = pY[ti] - sy;
+          const d = ddx * ddx + ddy * ddy;
+          if (d < bestD) { bestD = d; bestI = ti; }
+        }
+      }
+    }
+    if (bestI >= 0 && r >= 1) {
+      // Found in this ring; check one more ring to be safe, then stop
+      if (bestD < (r * CELL) * (r * CELL)) break;
+    }
+  }
+  return bestI;
 }
 
 function assignTargets(text) {
@@ -218,26 +249,53 @@ function assignTargets(text) {
   // Build target pool — cycle with jitter if fewer pixels than particles
   const poolX = new Float32Array(COUNT);
   const poolY = new Float32Array(COUNT);
+  const poolTaken = new Uint8Array(COUNT);
   for (let i = 0; i < COUNT; i++) {
     const src = (i % pairCount) * 2;
     poolX[i] = pts[src]     + (i < pairCount ? 0 : (Math.random() - 0.5) * 3);
     poolY[i] = pts[src + 1] + (i < pairCount ? 0 : (Math.random() - 0.5) * 3);
   }
 
-  // Sort indices by grid cell for spatial coherence
-  const tOrder = new Uint16Array(COUNT);
-  const pOrder = new Uint16Array(COUNT);
-  for (let i = 0; i < COUNT; i++) { tOrder[i] = i; pOrder[i] = i; }
-
-  tOrder.sort((a, b) => cellKey(poolX[a], poolY[a]) - cellKey(poolX[b], poolY[b]));
-  pOrder.sort((a, b) => cellKey(px[a], py[a]) - cellKey(px[b], py[b]));
-
-  // Match 1:1 in sorted order
+  // Build spatial grid of targets
+  const cols = Math.ceil(W / CELL) || 1;
+  const rows = Math.ceil(H / CELL) || 1;
+  const grid = new Array(cols * rows);
+  for (let i = 0; i < grid.length; i++) grid[i] = [];
   for (let i = 0; i < COUNT; i++) {
-    const pi = pOrder[i];
-    const ti = tOrder[i];
-    tx[pi] = poolX[ti];
-    ty[pi] = poolY[ti];
+    const c = Math.min(cols - 1, Math.max(0, (poolX[i] / CELL) | 0));
+    const r = Math.min(rows - 1, Math.max(0, (poolY[i] / CELL) | 0));
+    grid[r * cols + c].push(i);
+  }
+
+  // ── Phase 1: targeted particles → nearest available target ──
+  //    Uses current position so particles stay near their character.
+  for (let i = 0; i < COUNT; i++) {
+    if (tx[i] < 0) continue;   // skip wanderers
+    const best = gridNearest(px[i], py[i], grid, cols, rows, poolX, poolY, poolTaken);
+    if (best >= 0) {
+      poolTaken[best] = 1;
+      tx[i] = poolX[best];
+      ty[i] = poolY[best];
+    } else {
+      tx[i] = -1;
+      ty[i] = -1;
+    }
+  }
+
+  // ── Phase 2: remaining targets → wandering particles (grid-sort) ──
+  const remT = [];
+  for (let i = 0; i < COUNT; i++) { if (!poolTaken[i]) remT.push(i); }
+  const wand = [];
+  for (let i = 0; i < COUNT; i++) { if (tx[i] < 0) wand.push(i); }
+
+  const ck = (x, y) => ((y / CELL) | 0) * cols + ((x / CELL) | 0);
+  remT.sort((a, b) => ck(poolX[a], poolY[a]) - ck(poolX[b], poolY[b]));
+  wand.sort((a, b) => ck(px[a], py[a]) - ck(px[b], py[b]));
+
+  const n = Math.min(remT.length, wand.length);
+  for (let i = 0; i < n; i++) {
+    tx[wand[i]] = poolX[remT[i]];
+    ty[wand[i]] = poolY[remT[i]];
   }
 }
 
